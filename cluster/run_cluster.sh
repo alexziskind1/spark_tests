@@ -1,99 +1,157 @@
 #!/bin/bash
-#
-# Launch a Ray cluster inside Docker for vLLM inference.
-#
-# This script can start either a head node or a worker node, depending on the
-# --head or --worker flag provided as the third positional argument.
-#
+# =============================================================================
+# run_cluster.sh — auto-detect the right NIC/IP and launch a Ray node in Docker
 # Usage:
-# 1. Designate one machine as the head node and execute:
-#    bash run_cluster.sh \
-#         vllm/vllm-openai \
-#         <head_node_ip> \
-#         --head \
-#         /abs/path/to/huggingface/cache \
-#         -e VLLM_HOST_IP=<head_node_ip>
+#   run_cluster.sh <DOCKER_IMAGE> <HEAD_NODE_ADDRESS> <--head|--worker> <HF_HOME> [additional docker args...]
 #
-# 2. On every worker machine, execute:
-#    bash run_cluster.sh \
-#         vllm/vllm-openai \
-#         <head_node_ip> \
-#         --worker \
-#         /abs/path/to/huggingface/cache \
-#         -e VLLM_HOST_IP=<worker_node_ip>
-# 
-# Each worker requires a unique VLLM_HOST_IP value.
-# Keep each terminal session open. Closing a session stops the associated Ray
-# node and thereby shuts down the entire cluster.
-# Every machine must be reachable at the supplied IP address.
+# Examples:
+#   # Head:
+#   run_cluster.sh nvcr.io/nvidia/vllm:25.09-py3 10.0.0.10 --head ~/.cache/huggingface -e FOO=bar
 #
-# The container is named "node-<random_suffix>". To open a shell inside
-# a container after launch, use:
-#       docker exec -it node-<random_suffix> /bin/bash
+#   # Worker:
+#   run_cluster.sh nvcr.io/nvidia/vllm:25.09-py3 10.0.0.10 --worker ~/.cache/huggingface
 #
-# Then, you can execute vLLM commands on the Ray cluster as if it were a
-# single machine, e.g. vllm serve ...
-#
-# To stop the container, use:
-#       docker stop node-<random_suffix>
-
-# Check for minimum number of required arguments.
-if [ $# -lt 4 ]; then
-    echo "Usage: $0 docker_image head_node_ip --head|--worker path_to_hf_home [additional_args...]"
-    exit 1
+# Env overrides:
+#   MN_IF_NAME     : force a specific NIC, e.g. enp1s0f0np0
+#   VLLM_HOST_IP   : force this node's IP advertised to Ray
+#   CONTAINER_NAME : set container name (default: node-$RANDOM)
+# =============================================================================
+ 
+set -euo pipefail
+ 
+if [[ $# -lt 4 ]]; then
+  echo "Usage: $0 <DOCKER_IMAGE> <HEAD_NODE_ADDRESS> <--head|--worker> <HF_HOME> [extra docker args...]"
+  exit 64
 fi
-
-# Extract the mandatory positional arguments and remove them from $@.
-DOCKER_IMAGE="$1"
-HEAD_NODE_ADDRESS="$2"
-NODE_TYPE="$3"  # Should be --head or --worker.
-PATH_TO_HF_HOME="$4"
+ 
+DOCKER_IMAGE=$1
+HEAD_NODE_ADDRESS=$2      # ignored for --head, required for --worker (or set HEAD_NODE_IP env)
+NODE_TYPE=$3              # --head | --worker
+PATH_TO_HF_HOME=$4
 shift 4
-
-# Preserve any extra arguments so they can be forwarded to Docker.
 ADDITIONAL_ARGS=("$@")
-
-# Validate the NODE_TYPE argument.
-if [ "${NODE_TYPE}" != "--head" ] && [ "${NODE_TYPE}" != "--worker" ]; then
-    echo "Error: Node type must be --head or --worker"
-    exit 1
-fi
-
-# Generate a unique container name with random suffix.
-# Docker container names must be unique on each host.
-# The random suffix allows multiple Ray containers to run simultaneously on the same machine,
-# for example, on a multi-GPU machine.
-CONTAINER_NAME="node-${RANDOM}"
-
-# Define a cleanup routine that removes the container when the script exits.
-# This prevents orphaned containers from accumulating if the script is interrupted.
+ 
+CONTAINER_NAME="${CONTAINER_NAME:-node-${RANDOM}}"
+ 
+# -----------------------------------------------------------------------------
+# Cleanup on exit
+# -----------------------------------------------------------------------------
 cleanup() {
-    docker stop "${CONTAINER_NAME}"
-    docker rm "${CONTAINER_NAME}"
+  echo "Stopping and removing container ${CONTAINER_NAME}..."
+  docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  docker rm   "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-
-# Build the Ray start command based on the node role.
-# The head node manages the cluster and accepts connections on port 6379, 
-# while workers connect to the head's address.
-RAY_START_CMD="ray start --block"
-if [ "${NODE_TYPE}" == "--head" ]; then
-    RAY_START_CMD+=" --head --port=6379"
-else
-    RAY_START_CMD+=" --address=${HEAD_NODE_ADDRESS}:6379"
+ 
+# -----------------------------------------------------------------------------
+# Helper: pick the NIC that routes to the head (useful for workers)
+# -----------------------------------------------------------------------------
+route_nic_to_head() {
+  local dst="$1"
+  ip -o route get "$dst" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+ 
+# -----------------------------------------------------------------------------
+# Decide ACTIVE_IF (NIC)
+# Priority: MN_IF_NAME (env) -> route-to-head (workers) -> first UP CX-7-style NIC -> any UP ethernet
+# -----------------------------------------------------------------------------
+ACTIVE_IF=""
+if [[ -n "${MN_IF_NAME:-}" ]]; then
+  ACTIVE_IF="$MN_IF_NAME"
+elif [[ "$NODE_TYPE" == "--worker" ]]; then
+  # try to choose the NIC that actually reaches the head
+  ACTIVE_IF="$(route_nic_to_head "${HEAD_NODE_ADDRESS}")" || true
 fi
-
-# Launch the container with the assembled parameters.
-# --network host: Allows Ray nodes to communicate directly via host networking
-# --shm-size 10.24g: Increases shared memory
-# --gpus all: Gives container access to all GPUs on the host
-# -v HF_HOME: Mounts HuggingFace cache to avoid re-downloading models
+ 
+# Fallbacks if still empty
+if [[ -z "${ACTIVE_IF}" || "${ACTIVE_IF}" == "lo" ]]; then
+  # prefer CX-7 naming first if present and UP
+  ACTIVE_IF=$(ip -br addr show | awk '/enp[0-9]+s0f[01]np[01].*UP/ {print $1; exit}') || true
+fi
+if [[ -z "${ACTIVE_IF}" || "${ACTIVE_IF}" == "lo" ]]; then
+  # any up ethernet-like interface
+  ACTIVE_IF=$(ip -br addr show | awk '/^e.*\s+UP/ {print $1; exit}') || true
+fi
+ 
+if [[ -z "${ACTIVE_IF}" || "${ACTIVE_IF}" == "lo" ]]; then
+  echo "❌ Could not determine an active non-loopback interface. Set MN_IF_NAME explicitly."
+  exit 1
+fi
+ 
+# -----------------------------------------------------------------------------
+# Decide ACTIVE_IP (this node's advertised IP)
+# Priority: VLLM_HOST_IP (env) -> first global IPv4 on ACTIVE_IF -> any IPv4 on ACTIVE_IF (incl. 169.254)
+# As a last resort on worker: IP bound to route to head
+# -----------------------------------------------------------------------------
+if [[ -n "${VLLM_HOST_IP:-}" ]]; then
+  ACTIVE_IP="$VLLM_HOST_IP"
+else
+  ACTIVE_IP=$(ip -o -4 addr show dev "$ACTIVE_IF" scope global | awk '{print $4}' | cut -d/ -f1 | head -n1) || true
+  if [[ -z "${ACTIVE_IP:-}" ]]; then
+    # allow link-local if that's what you really use
+    ACTIVE_IP=$(ip -o -4 addr show dev "$ACTIVE_IF" | awk '{print $4}' | cut -d/ -f1 | head -n1) || true
+  fi
+  if [[ -z "${ACTIVE_IP:-}" && "$NODE_TYPE" == "--worker" ]]; then
+    # extract src address used to reach head (ip route get …)
+    ACTIVE_IP=$(ip -o route get "$HEAD_NODE_ADDRESS" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || true
+  fi
+fi
+ 
+if [[ -z "${ACTIVE_IP:-}" ]]; then
+  echo "❌ Could not determine an IPv4 address for ${ACTIVE_IF}. Set VLLM_HOST_IP explicitly."
+  exit 1
+fi
+ 
+export VLLM_HOST_IP="$ACTIVE_IP"
+echo "✅ Using interface: ${ACTIVE_IF}"
+echo "✅ Using IP:        ${VLLM_HOST_IP}"
+ 
+# -----------------------------------------------------------------------------
+# Validate head/worker inputs
+# -----------------------------------------------------------------------------
+if [[ "$NODE_TYPE" != "--head" && "$NODE_TYPE" != "--worker" ]]; then
+  echo "❌ Node type must be --head or --worker (got: ${NODE_TYPE})"
+  exit 64
+fi
+if [[ "$NODE_TYPE" == "--worker" && -z "${HEAD_NODE_ADDRESS}" ]]; then
+  echo "❌ Worker requires HEAD_NODE_ADDRESS (IP or hostname of the head node)."
+  exit 64
+fi
+ 
+# -----------------------------------------------------------------------------
+# Build Ray start command
+# -----------------------------------------------------------------------------
+RAY_PORT=6379
+RAY_START_CMD="ray start --block --node-ip-address=${VLLM_HOST_IP}"
+if [[ "${NODE_TYPE}" == "--head" ]]; then
+  RAY_START_CMD+=" --head --port=${RAY_PORT} --dashboard-host=0.0.0.0"
+else
+  # Allow HEAD_NODE_IP via env to override the positional arg
+  HEAD_ADDR="${HEAD_NODE_IP:-$HEAD_NODE_ADDRESS}"
+  RAY_START_CMD+=" --address=${HEAD_ADDR}:${RAY_PORT}"
+fi
+ 
+echo "Starting Ray with:"
+echo "  ${RAY_START_CMD}"
+echo "Container name: ${CONTAINER_NAME}"
+ 
+# -----------------------------------------------------------------------------
+# Docker launch
+# -----------------------------------------------------------------------------
 docker run \
-    --entrypoint /bin/bash \
-    --network host \
-    --name "${CONTAINER_NAME}" \
-    --shm-size 10.24g \
-    --gpus all \
-    -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
-    "${ADDITIONAL_ARGS[@]}" \
-    "${DOCKER_IMAGE}" -c "${RAY_START_CMD}"
+  --entrypoint /bin/bash \
+  --network host \
+  --name "${CONTAINER_NAME}" \
+  --shm-size 10.24g \
+  --gpus all \
+  -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
+  -e RAY_NODE_IP_ADDRESS="${VLLM_HOST_IP}" \
+  -e RAY_OVERRIDE_NODE_IP_ADDRESS="${VLLM_HOST_IP}" \
+  -e RAY_DASHBOARD_HOST="0.0.0.0" \
+  -e UCX_NET_DEVICES="${ACTIVE_IF}" \
+  -e NCCL_SOCKET_IFNAME="${ACTIVE_IF}" \
+  -e OMPI_MCA_btl_tcp_if_include="${ACTIVE_IF}" \
+  -e GLOO_SOCKET_IFNAME="${ACTIVE_IF}" \
+  -e TP_SOCKET_IFNAME="${ACTIVE_IF}" \
+  "${ADDITIONAL_ARGS[@]}" \
+  "${DOCKER_IMAGE}" -c "${RAY_START_CMD}"
