@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# nccl_env_select.sh — pick an active CX-7 interface, export env for NCCL/UCX/MPI
-# Source this file to persist exports in your current shell.
-#   source ./nccl_env_select.sh
-# You can pre-set IFACE/IP to skip the picker:
-#   IFACE=enp1s0f1np1 IP=169.254.12.34 source ./nccl_env_select.sh
+# nccl_env_select.sh — interactive picker for NCCL/UCX/MPI env
+# Default: ALWAYS prompt, even if IFACE is already set.
+# Use:     source ./nccl_env_select.sh          # interactive
+#          source ./nccl_env_select.sh --auto   # use existing IFACE/IP or auto-pick first
 
 set -euo pipefail
 
-# ---- Basics (adjust if your paths differ) ----
+MODE="prompt"
+if [[ "${1:-}" == "--auto" ]]; then
+  MODE="auto"
+fi
+
+# ----- Basics (adjust if paths differ) -----
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 if [[ -d /usr/lib/aarch64-linux-gnu/openmpi ]]; then
   export MPI_HOME="${MPI_HOME:-/usr/lib/aarch64-linux-gnu/openmpi}"
@@ -18,7 +22,7 @@ export NCCL_HOME="${NCCL_HOME:-$HOME/nccl/build}"
 
 _pick_iface() {
   if ! command -v ibdev2netdev >/dev/null 2>&1; then
-    echo "ERROR: ibdev2netdev not found. Install Mellanox OFED / NVIDIA net tools." >&2
+    echo "ERROR: ibdev2netdev not found (install NVIDIA/Mellanox net tools)." >&2
     return 1
   fi
 
@@ -29,44 +33,53 @@ _pick_iface() {
     return 2
   fi
 
-  # Extract netdev name (right side after ==> ... (Up))
-  IFACES=()
+  # Extract netdev names and filter out enP2p* (we prefer enp1* on Spark)
+  CANDIDATES=()
   for L in "${RAW[@]}"; do
-    # shellcheck disable=SC2001
-    CAND="$(echo "$L" | sed -E 's/.*==>\s*([a-zA-Z0-9_.:-]+)\s*\(Up\).*/\1/')"
-    IFACES+=("$CAND")
+    DEV="$(sed -E 's/.*==>\s*([a-zA-Z0-9_.:-]+)\s*\(Up\).*/\1/' <<<"$L")"
+    [[ "$DEV" =~ ^enP2p ]] && continue
+    CANDIDATES+=("$DEV")
+  done
+  # If nothing left after filter, fall back to all Up devs
+  if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
+    for L in "${RAW[@]}"; do
+      DEV="$(sed -E 's/.*==>\s*([a-zA-Z0-9_.:-]+)\s*\(Up\).*/\1/' <<<"$L")"
+      CANDIDATES+=("$DEV")
+    done
+  fi
+
+  # De-dup, keep order
+  declare -A seen=()
+  UNIQUE=()
+  for d in "${CANDIDATES[@]}"; do
+    [[ ${seen["$d"]+x} ]] || { UNIQUE+=("$d"); seen["$d"]=1; }
   done
 
-  # De-duplicate while preserving order
-  UNIQUE=()
-  declare -A seen=()
-  for i in "${IFACES[@]}"; do
-    [[ ${seen["$i"]+x} ]] || { UNIQUE+=("$i"); seen["$i"]=1; }
-  done
+  if [[ "$MODE" == "auto" ]]; then
+    IFACE="${IFACE:-${UNIQUE[0]}}"
+    export IFACE
+    return 0
+  fi
 
   echo "Select the interface to use:"
   for i in "${!UNIQUE[@]}"; do
-    idx=$((i+1))
+    n=$((i+1))
     ip4=$(ip -4 addr show "${UNIQUE[$i]}" 2>/dev/null | awk '/inet / {print $2}' | head -n1)
     ip4=${ip4:-"(no IPv4)"}
-    # mark favorites (enp1…) visually
     fav=""
     [[ "${UNIQUE[$i]}" =~ ^enp1 ]] && fav=" *preferred"
-    printf "  %2d) %-16s %-18s%s\n" "$idx" "${UNIQUE[$i]}" "$ip4" "$fav"
+    printf "  %2d) %-16s %-18s%s\n" "$n" "${UNIQUE[$i]}" "$ip4" "$fav"
   done
   echo "  0) Cancel"
 
   while true; do
     read -r -p "Enter number: " CH
     [[ "$CH" =~ ^[0-9]+$ ]] || { echo "Enter a number."; continue; }
-    if (( CH == 0 )); then
-      return 3
-    fi
+    (( CH == 0 )) && return 3
     if (( CH >= 1 && CH <= ${#UNIQUE[@]} )); then
-      SEL="${UNIQUE[$((CH-1))]}"
-      echo "Chosen: $SEL"
-      IFACE="$SEL"
+      IFACE="${UNIQUE[$((CH-1))]}"
       export IFACE
+      echo "Chosen: $IFACE"
       break
     else
       echo "Out of range."
@@ -74,28 +87,24 @@ _pick_iface() {
   done
 }
 
-# If IFACE not preset, run picker
+# Always pick (unless --auto)
 IFACE="${IFACE:-}"
-if [[ -z "$IFACE" ]]; then
-  _pick_iface || return $?
+if ! _pick_iface; then
+  return $?
 fi
 
 # Derive IPv4 if not preset
 IP="${IP:-}"
 if [[ -z "$IP" ]]; then
-  _cidr="$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet / {print $2; exit}')"
-  if [[ -n "$_cidr" ]]; then
-    IP="${_cidr%%/*}"
-  else
-    echo "WARNING: No IPv4 found on $IFACE. UCX/NCCL may not work until an IP is assigned."
-  fi
+  CIDR="$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet / {print $2; exit}')"
+  [[ -n "$CIDR" ]] && IP="${CIDR%%/*}" || IP=""
 fi
 
-# Core exports for networking
-[[ -n "${IFACE:-}" ]] && export UCX_NET_DEVICES="$IFACE" \
-                             NCCL_SOCKET_IFNAME="$IFACE" \
-                             OMPI_MCA_btl_tcp_if_include="$IFACE"
-[[ -n "${IP:-}"    ]] && export SPARK_LOCAL_IP="$IP"
+# Core exports
+[[ -n "$IFACE" ]] && export UCX_NET_DEVICES="$IFACE" \
+                           NCCL_SOCKET_IFNAME="$IFACE" \
+                           OMPI_MCA_btl_tcp_if_include="$IFACE"
+[[ -n "$IP"    ]] && export SPARK_LOCAL_IP="$IP"
 
 # Libraries
 LD_MERGED="$NCCL_HOME/lib:$CUDA_HOME/lib64:$MPI_HOME/lib"
@@ -107,4 +116,7 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export NCCL_IB_CUDA_SUPPORT=1
 export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-2}"
 
+if [[ -z "$IP" ]]; then
+  echo "WARNING: No IPv4 found on $IFACE. Assign an IP (e.g., link-local) before running NCCL/UCX."
+fi
 echo "[NCCL env] IFACE=${IFACE:-<unset>}  IP=${IP:-<unset>}  CUDA_HOME=$CUDA_HOME"
