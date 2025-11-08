@@ -18,7 +18,7 @@ echo "✓ HuggingFace login completed"
 # Step 2: Set environment variables
 echo ""
 echo "Step 2: Setting environment variables..."
-source ./vllm_01_env_spark2.sh
+. ./vllm_01_env_spark2.sh
 echo "✓ Environment variables set:"
 echo "  - VLLM_IMAGE: $VLLM_IMAGE"
 echo "  - MN_IF_NAME: $MN_IF_NAME"
