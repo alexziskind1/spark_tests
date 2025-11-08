@@ -31,7 +31,7 @@ PATH_TO_HF_HOME=$4
 shift 4
 ADDITIONAL_ARGS=("$@")
  
-CONTAINER_NAME="${CONTAINER_NAME:-node-${RANDOM}}"
+#CONTAINER_NAME="${CONTAINER_NAME:-node-${RANDOM}}"
  
 # -----------------------------------------------------------------------------
 # Cleanup on exit
