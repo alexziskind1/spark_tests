@@ -32,6 +32,7 @@ shift 4
 ADDITIONAL_ARGS=("$@")
  
 #CONTAINER_NAME="${CONTAINER_NAME:-node-${RANDOM}}"
+CONTAINER_NAME="${CONTAINER_NAME:-ray-node}"
  
 # -----------------------------------------------------------------------------
 # Cleanup on exit
